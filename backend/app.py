@@ -9,6 +9,8 @@ from typing import List, Optional
 from pathlib import Path
 import os,json,time,uuid,asyncio,logging,tempfile,subprocess,threading,shutil,concurrent.futures,psutil,torch
 from faster_whisper import WhisperModel
+import requests
+import re
 
 # --- Modelos Pydantic para Validação de Requisições ---
 
@@ -58,14 +60,16 @@ app = FastAPI(title="Video Processing API", version="5.0.0")
 # Middleware para permitir requisições de diferentes origens (CORS)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:8000", "http://127.0.0.1:8000", "http://localhost:3000"],
+    allow_origin_regex=r"http://localhost:5173|http://127.0.0.1:5173|http://localhost:3000|http://127.0.0.1:3000|http://localhost:8000|http://127.0.0.1:8000",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
 )
 
 # --- Configurações Globais e Constantes ---
-FILES_DIR = os.path.join(os.getcwd(), "files")
+# Corrige o diretório para garantir que a pasta 'files' fique sempre ao lado do app.py
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FILES_DIR = os.path.join(BASE_DIR, "files")
 os.makedirs(FILES_DIR, exist_ok=True)
 app.mount("/files", StaticFiles(directory=FILES_DIR), name="files")
 
@@ -151,37 +155,189 @@ def create_srt(captions: List[dict], srt_path: str):
             if not text: continue
             f.write(f"{c['id']}\n{format_srt_time(float(c['start']))} --> {format_srt_time(float(c['end']))}\n{text}\n\n")
 
+def get_hardware_acceleration():
+    """Detecta e retorna o melhor método de aceleração por hardware disponível."""
+    try:
+        # Verifica NVIDIA NVENC
+        nvenc_check = subprocess.run(['ffmpeg', '-encoders'], capture_output=True, text=True)
+        if 'hevc_nvenc' in nvenc_check.stdout:
+            return {
+                'hwaccel': 'cuda',
+                'encoder': 'hevc_nvenc',
+                'extra_params': ['-rc:v', 'vbr_hq', '-qmin', '0', '-qmax', '30']
+            }
+        
+        # Verifica Intel QuickSync
+        qsv_check = subprocess.run(['ffmpeg', '-encoders'], capture_output=True, text=True)
+        if 'h264_qsv' in qsv_check.stdout:
+            return {
+                'hwaccel': 'qsv',
+                'encoder': 'h264_qsv',
+                'extra_params': ['-global_quality', '28']
+            }
+        
+        # Verifica VAAPI
+        vaapi_check = subprocess.run(['ffmpeg', '-hwaccels'], capture_output=True, text=True)
+        if 'vaapi' in vaapi_check.stdout:
+            return {
+                'hwaccel': 'vaapi',
+                'encoder': 'h264_vaapi',
+                'extra_params': ['-vaapi_device', '/dev/dri/renderD128', '-vf', 'format=nv12|vaapi,hwupload']
+            }
+        
+        # Fallback para CPU
+        return {
+            'hwaccel': None,
+            'encoder': 'libx264',
+            'extra_params': []
+        }
+    except Exception as e:
+        logger.warning(f"Erro ao detectar aceleração por hardware: {e}")
+        return {
+            'hwaccel': None,
+            'encoder': 'libx264',
+            'extra_params': []
+        }
+
+def style_to_drawtext(style_dict):
+    """Converte um dicionário de estilo para argumentos do drawtext do FFmpeg."""
+    cache_key = json.dumps(style_dict, sort_keys=True)
+    if not hasattr(style_to_drawtext, 'cache'):
+        style_to_drawtext.cache = {}
+    cache = style_to_drawtext.cache
+    if cache_key in cache:
+        return cache[cache_key]
+    args = {}
+    # Fonte
+    if 'fontFamily' in style_dict:
+        args['fontfile'] = f"/usr/share/fonts/truetype/{style_dict['fontFamily'].split(',')[0].strip()}.ttf"
+    # Tamanho
+    if 'fontSize' in style_dict:
+        args['fontsize'] = str(int(style_dict['fontSize']))
+    # Cor
+    if 'color' in style_dict:
+        color = style_dict['color']
+        if color.startswith('#') and len(color) == 7:
+            args['fontcolor'] = color
+    # Sombra
+    if 'shadow' in style_dict:
+        try:
+            args['shadowx'] = args['shadowy'] = str(int(float(style_dict['shadow'])))
+        except: pass
+    # Outline
+    if 'outline' in style_dict:
+        try:
+            args['borderw'] = str(int(float(style_dict['outline'])))
+        except: pass
+    # Fundo
+    if 'backgroundColor' in style_dict and style_dict['backgroundColor'] != 'transparent':
+        bg = style_dict['backgroundColor']
+        if bg.startswith('#') and len(bg) == 7:
+            args['box'] = '1'
+            args['boxcolor'] = bg + '@0.7'
+    # Posição
+    if 'position' in style_dict:
+        pos = style_dict['position']
+        if pos == 'top':
+            args['y'] = 'h*0.05'
+        elif pos == 'middle':
+            args['y'] = '(h-text_h)/2'
+        else:
+            args['y'] = 'h-text_h-40'
+    else:
+        args['y'] = 'h-text_h-40'
+    args['x'] = '(w-text_w)/2'
+    cache[cache_key] = args
+    return args
+
+def generate_drawtext_filters(captions, style_dict):
+    """Gera filtros drawtext para cada legenda com base no estilo."""
+    filters = []
+    for c in captions:
+        if not all(k in c for k in ['start','end','text']): continue
+        args = style_to_drawtext(style_dict or {})
+        text = str(c['text']).replace(':', '\\:').replace("'", "\\'").replace('\\', '\\\\')
+        enable = f"between(t,{float(c['start'])},{float(c['end'])})"
+        drawtext = f"drawtext=text='{text}'"
+        for k, v in args.items():
+            drawtext += f":{k}={v}"
+        drawtext += f":enable='{enable}'"
+        filters.append(drawtext)
+    return filters
+
+def get_video_resolution(video_path):
+    """Obtém a resolução (largura, altura) do vídeo usando ffprobe."""
+    try:
+        probe = subprocess.run([
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height',
+            '-of', 'json', video_path
+        ], capture_output=True, text=True)
+        info = json.loads(probe.stdout)
+        width = info['streams'][0]['width']
+        height = info['streams'][0]['height']
+        return width, height
+    except Exception as e:
+        logger.warning(f"Não foi possível detectar resolução do vídeo: {e}")
+        return None, None
+
+def get_temp_dir():
+    """Retorna um diretório temporário preferencialmente em SSD."""
+    # Linux: /tmp geralmente é SSD/ramdisk, Windows: tenta C:/Temp, fallback para padrão
+    candidates = [
+        os.environ.get('FAST_TEMP'),
+        '/tmp',
+        'C:/Temp',
+        'D:/Temp',
+        tempfile.gettempdir()
+    ]
+    for d in candidates:
+        if d and os.path.isdir(d) and os.access(d, os.W_OK):
+            return d
+    return tempfile.gettempdir()
+
+YOUTUBE_API_KEY = "AIzaSyDSxPM0Rx-qiwGYUrbzCznCjufx3smrXCk"
+
 # --- Endpoints da API ---
 
 @app.post("/api/youtube-metadata")
 async def get_youtube_metadata(request: YouTubeURLRequest):
-    """Extrai metadados de um vídeo do YouTube sem fazer o download completo."""
+    """Extrai metadados de um vídeo do YouTube usando a YouTube Data API v3."""
     url = request.url
     parsed_url = urlparse(url)
     if 'youtube.com' not in parsed_url.netloc and 'youtu.be' not in parsed_url.netloc:
         raise HTTPException(status_code=400, detail="URL inválida. Apenas links do YouTube são permitidos.")
 
-    ydl_opts = {'noplaylist': True, 'quiet': True, 'no_warnings': True}
+    # Extrai o video_id
+    match = re.search(r'(?:v=|youtu.be/)([\w-]{11})', url)
+    if not match:
+        raise HTTPException(status_code=400, detail="Não foi possível extrair o ID do vídeo.")
+    video_id = match.group(1)
 
+    api_url = f"https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails&id={video_id}&key={YOUTUBE_API_KEY}"
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(executor, lambda: ydl.extract_info(url, download=False))
-        
-        duration = info.get('duration', 0)
-        minutes, seconds = divmod(duration, 60)
-        
+        resp = requests.get(api_url)
+        data = resp.json()
+        if not resp.ok or 'items' not in data or not data['items']:
+            raise HTTPException(status_code=404, detail="Vídeo não encontrado ou erro na API do YouTube.")
+        item = data['items'][0]
+        snippet = item['snippet']
+        content_details = item['contentDetails']
+        # Duração ISO 8601 para segundos
+        import isodate
+        duration = isodate.parse_duration(content_details['duration']).total_seconds()
+        minutes, seconds = divmod(int(duration), 60)
         metadata = {
-            "title": info.get('title', 'Título não disponível'),
-            "thumbnail": info.get('thumbnail', ''),
-            "duration": duration,
-            "duration_formatted": f"{int(minutes):02}:{int(seconds):02}",
-            "author": info.get('uploader', 'Autor desconhecido'),
+            "title": snippet.get('title', 'Título não disponível'),
+            "thumbnail": snippet.get('thumbnails', {}).get('high', {}).get('url', ''),
+            "duration": int(duration),
+            "duration_formatted": f"{minutes:02}:{seconds:02}",
+            "author": snippet.get('channelTitle', 'Autor desconhecido'),
         }
         return JSONResponse(content=metadata)
     except Exception as e:
-        logger.error(f"Erro ao buscar metadados do YouTube: {e}")
-        raise HTTPException(status_code=500, detail="Falha ao obter metadados do vídeo. Verifique a URL ou tente novamente.")
+        logger.error(f"Erro ao buscar metadados do YouTube Data API: {e}")
+        raise HTTPException(status_code=500, detail="Falha ao obter metadados do vídeo pela API do YouTube.")
 
 @app.post("/api/download_youtube")
 async def download_youtube_video(request: YouTubeDownloadRequest, background_tasks: BackgroundTasks):
@@ -233,9 +389,21 @@ async def transcribe_video(file: UploadFile = File(...), model: str = Form(DEFAU
             temp_video = os.path.join(temp_dir, f"video{Path(file.filename).suffix}")
             file_size = await save_file_stream(file, temp_video)
 
+            # Verifica se o arquivo é um vídeo válido antes de extrair áudio
+            probe_cmd = [
+                "ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "default=noprint_wrappers=1:nokey=1", temp_video
+            ]
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+            if probe_result.returncode != 0 or not probe_result.stdout.strip():
+                raise HTTPException(status_code=400, detail="O arquivo enviado não contém uma trilha de áudio válida ou não é um vídeo suportado.")
+
             update_status(session_id, "Extraindo áudio...", 3)
             temp_audio = os.path.join(temp_dir, "audio.wav")
-            run_ffmpeg(get_ffmpeg_cmd(temp_video, temp_audio), "Erro ao extrair áudio")
+            try:
+                run_ffmpeg(get_ffmpeg_cmd(temp_video, temp_audio), "Erro ao extrair áudio")
+            except HTTPException as ffmpeg_exc:
+                logger.error(f"FFmpeg erro: {ffmpeg_exc.detail}")
+                raise HTTPException(status_code=400, detail=f"Erro ao extrair áudio: {ffmpeg_exc.detail}")
 
             update_status(session_id, "Carregando modelo...", 5)
             whisper_model = get_model(model)
@@ -258,41 +426,147 @@ async def transcribe_video(file: UploadFile = File(...), model: str = Form(DEFAU
             raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/render")
-async def render_video(file: UploadFile = File(...), captions: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()):
-    """Renderiza legendas em um arquivo de vídeo."""
+async def render_video(
+    file: UploadFile = File(...),
+    captions: UploadFile = File(...),
+    style: str = Form(None),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """Renderiza legendas em um arquivo de vídeo e serve como arquivo temporário seguro."""
     validate_file(file)
     if not captions.filename or not captions.filename.endswith('.json'):
         raise HTTPException(status_code=400, detail="Legendas devem ser um arquivo JSON.")
 
-    import re
-    with tempfile.TemporaryDirectory() as temp_dir:
-        try:
+    import re, tempfile
+    try:
+        # Cria arquivo temporário seguro para o vídeo de saída
+        # Usa SSD para arquivos temporários se disponível
+        temp_root = get_temp_dir()
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4', dir=temp_root) as temp_output:
+            output_video = temp_output.name
+        with tempfile.TemporaryDirectory(dir=temp_root) as temp_dir:
             temp_video = os.path.join(temp_dir, f"video{Path(file.filename).suffix}")
             await save_file_stream(file, temp_video)
+
+            # Corrige erro: obtém resolução do vídeo
+            orig_width, orig_height = get_video_resolution(temp_video)
 
             captions_data = json.loads(await captions.read())
             if not isinstance(captions_data, list): raise ValueError("JSON de legendas inválido.")
 
             srt_path = os.path.join(temp_dir, "subtitles.srt")
             create_srt(captions_data, srt_path)
-            output_video = os.path.join(temp_dir, "output.mp4")
             srt_escaped = srt_path.replace('\\', '/').replace(':', '\\:')
-            vf_filter = f"subtitles='{srt_escaped}':force_style='Fontsize=16,Outline=1,Shadow=0.5,BorderStyle=1,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&'"
-            render_cmd = ["ffmpeg", "-i", temp_video, "-vf", vf_filter, "-c:a", "copy", "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-y", output_video]
-            run_ffmpeg(render_cmd, "Erro ao renderizar vídeo", timeout=600)
+
+            # --- NOVO force_style ---
+            force_style = "Fontsize=16,Outline=1,Shadow=0.5,BorderStyle=1,PrimaryColour=&HFFFFFF&,OutlineColour=&H000000&,BackColour=&H80000000&,Alignment=8,Box=1,BoxColour=&H80000000&"
+            if style:
+                try:
+                    style_dict = json.loads(style)
+                    # Font size
+                    if 'fontSize' in style_dict:
+                        force_style = re.sub(r'Fontsize=\\d+', f"Fontsize={int(style_dict['fontSize'])}", force_style)
+                    # Font family
+                    if 'fontFamily' in style_dict:
+                        font = str(style_dict['fontFamily']).split(',')[0].strip()
+                        force_style += f",Fontname={font}"
+                    # Font color
+                    if 'color' in style_dict:
+                        color = style_dict['color']
+                        if color.startswith('#') and len(color) == 7:
+                            r = color[1:3]
+                            g = color[3:5]
+                            b = color[5:7]
+                            force_style = re.sub(r'PrimaryColour=&H[0-9A-Fa-f]+&', f"PrimaryColour=&H00{b}{g}{r}&", force_style)
+                    # Background color
+                    if 'backgroundColor' in style_dict:
+                        bg = style_dict['backgroundColor']
+                        if isinstance(bg, str) and bg.startswith('#') and len(bg) == 7:
+                            r = bg[1:3]
+                            g = bg[3:5]
+                            b = bg[5:7]
+                            # BackColour para ASS, BoxColour para ffmpeg
+                            force_style = re.sub(r'BackColour=&H[0-9A-Fa-f]+&', f"BackColour=&H80{b}{g}{r}&", force_style)
+                            force_style = re.sub(r'BoxColour=&H[0-9A-Fa-f]+&', f"BoxColour=&H80{b}{g}{r}&", force_style)
+                        elif isinstance(bg, str) and bg.startswith('rgba'):
+                            m = re.match(r'rgba\\((\\d+), ?(\\d+), ?(\\d+)(?:, ?([\\d.]+))?\\)', bg)
+                            if m:
+                                r, g, b = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                                a = float(m.group(4)) if m.group(4) else 0.7
+                                alpha = int((1-a)*255)
+                                force_style = re.sub(r'BackColour=&H[0-9A-Fa-f]+&', f"BackColour=&H{alpha:02X}{b:02X}{g:02X}{r:02X}&", force_style)
+                                force_style = re.sub(r'BoxColour=&H[0-9A-Fa-f]+&', f"BoxColour=&H{alpha:02X}{b:02X}{g:02X}{r:02X}&", force_style)
+                    # Outline
+                    if 'outline' in style_dict:
+                        try:
+                            outline = float(style_dict['outline'])
+                            force_style = re.sub(r'Outline=\\d+(\\.\\d+)?', f"Outline={outline}", force_style)
+                        except: pass
+                    # Shadow
+                    if 'shadow' in style_dict:
+                        try:
+                            shadow = float(style_dict['shadow'])
+                            force_style = re.sub(r'Shadow=\\d+(\\.\\d+)?', f"Shadow={shadow}", force_style)
+                        except: pass
+                    # Posição (Alignment)
+                    if 'position' in style_dict:
+                        pos = style_dict['position']
+                        alignment = {'bottom':8, 'top':2, 'middle':5}.get(pos,8)
+                        force_style = re.sub(r'Alignment=\\d+', f"Alignment={alignment}", force_style)
+                except Exception as e:
+                    logger.warning(f"Estilo de legenda inválido: {e}")
+            vf_filter = f"subtitles='{srt_escaped}':force_style='{force_style}'"
+            # Substitui o comando de renderização para mais velocidade e menor qualidade
+            # Tenta usar NVENC se disponível, senão cai para libx265 puro
+            import shutil
+            # Verifica se hevc_nvenc está disponível
+            ffmpeg_encoders = subprocess.run(['ffmpeg', '-encoders'], capture_output=True, text=True).stdout
+            if 'hevc_nvenc' in ffmpeg_encoders:
+                codec = 'hevc_nvenc'
+            elif 'libx265' in ffmpeg_encoders:
+                codec = 'libx265'
+            else:
+                codec = 'libx264'  # Fallback universal
+            render_cmd = [
+                "ffmpeg", "-y",
+                "-i", temp_video,
+                "-vf", vf_filter,
+                "-c:a", "copy",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "28",
+                "-movflags", "+faststart",
+                "-bufsize", "4M",
+                "-maxrate", "8M",
+                "-sc_threshold", "0",
+            ]
+            if orig_width and orig_height:
+                render_cmd.extend(["-s", f"{orig_width}x{orig_height}"])
+            render_cmd.append(output_video)
+            logger.info(f"Comando FFmpeg: {' '.join(render_cmd)}")
+            try:
+                run_ffmpeg(render_cmd, "Erro ao renderizar vídeo", timeout=600)
+            except HTTPException as ffmpeg_exc:
+                logger.error(f"FFmpeg erro: {ffmpeg_exc.detail}")
+                raise HTTPException(status_code=500, detail=f"Erro ao renderizar vídeo: {ffmpeg_exc.detail}")
             if not os.path.exists(output_video): raise HTTPException(status_code=500, detail="Arquivo renderizado não foi criado.")
 
-            # Corrigido: salva o arquivo legendado em FILES_DIR com nome seguro
-            safe_filename = re.sub(r'[<>:"/\\|?*]', '_', f"legendado_{Path(file.filename).stem}.mp4")
-            persist_path = os.path.join(FILES_DIR, safe_filename)
-            shutil.copy2(output_video, persist_path)
-            # Opcional: agendar limpeza futura, se desejar
-            # background_tasks.add_task(os.remove, persist_path)
-            return JSONResponse({"filename": safe_filename, "url": f"/files/{safe_filename}"})
-        except Exception as e:
-            logger.error(f"Erro na renderização: {e}")
-            if isinstance(e, HTTPException): raise e
-            raise HTTPException(status_code=500, detail=str(e))
+        # Streaming de saída: envia o arquivo enquanto é lido
+        def iterfile(path):
+            with open(path, mode="rb") as file_like:
+                while chunk := file_like.read(1024*1024):
+                    yield chunk
+        background_tasks.add_task(os.remove, output_video)
+        safe_filename = re.sub(r'[<>:"/\\|?*]', '_', f"legendado_{Path(file.filename).stem}.mp4")
+        file_size = os.path.getsize(output_video)
+        return StreamingResponse(iterfile(output_video), media_type='video/mp4', headers={
+            'Content-Disposition': f'attachment; filename="{safe_filename}"',
+            'Content-Length': str(file_size)
+        }, background=background_tasks)
+    except Exception as e:
+        logger.error(f"Erro na renderização: {e}")
+        if isinstance(e, HTTPException): raise e
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/transcribe-status")
 async def status_stream(request: Request, session_id: str):

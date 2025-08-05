@@ -1,44 +1,62 @@
 {
-  "hash": "859fa671",
-  "browserHash": "84fd0a7d",
+  "hash": "8bcc2eea",
+  "browserHash": "8dc55045",
   "optimized": {
     "react": {
       "src": "../../node_modules/react/index.js",
       "file": "react.js",
-      "fileHash": "9090a3a9",
+      "fileHash": "456fd25d",
       "needsInterop": true
     },
     "react-dom": {
       "src": "../../node_modules/react-dom/index.js",
       "file": "react-dom.js",
-      "fileHash": "495125af",
+      "fileHash": "9b0aa1c9",
       "needsInterop": true
     },
     "react/jsx-dev-runtime": {
       "src": "../../node_modules/react/jsx-dev-runtime.js",
       "file": "react_jsx-dev-runtime.js",
-      "fileHash": "d41a4a33",
+      "fileHash": "b8c8486b",
       "needsInterop": true
     },
     "react/jsx-runtime": {
       "src": "../../node_modules/react/jsx-runtime.js",
       "file": "react_jsx-runtime.js",
-      "fileHash": "a8cac18a",
+      "fileHash": "adad985e",
       "needsInterop": true
+    },
+    "lucide-react": {
+      "src": "../../node_modules/lucide-react/dist/esm/lucide-react.mjs",
+      "file": "lucide-react.js",
+      "fileHash": "92b2fa4d",
+      "needsInterop": false
+    },
+    "qrcode.react": {
+      "src": "../../node_modules/qrcode.react/lib/esm/index.js",
+      "file": "qrcode__react.js",
+      "fileHash": "33c35a9c",
+      "needsInterop": false
     },
     "react-dom/client": {
       "src": "../../node_modules/react-dom/client.js",
       "file": "react-dom_client.js",
-      "fileHash": "3f0f0cdd",
+      "fileHash": "3418a3f3",
       "needsInterop": true
+    },
+    "react-router-dom": {
+      "src": "../../node_modules/react-router-dom/dist/index.js",
+      "file": "react-router-dom.js",
+      "fileHash": "93de6e5b",
+      "needsInterop": false
     }
   },
   "chunks": {
-    "chunk-MKFI7NYJ": {
-      "file": "chunk-MKFI7NYJ.js"
+    "chunk-47D5AHTN": {
+      "file": "chunk-47D5AHTN.js"
     },
-    "chunk-GIQZIPNC": {
-      "file": "chunk-GIQZIPNC.js"
+    "chunk-B46YTOBL": {
+      "file": "chunk-B46YTOBL.js"
     }
   }
 }

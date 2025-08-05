@@ -1,0 +1,16 @@
+﻿{
+  "root": "dist",
+  "clean_urls": true,
+  "routes": {
+    "/**": "index.html"
+  },
+  "headers": {
+    "/**": {
+      "Cache-Control": "public, max-age=0, must-revalidate",
+      "Access-Control-Allow-Origin": "*"
+    },
+    "/assets/**": {
+      "Cache-Control": "public, max-age=31536000, immutable"
+    }
+  }
+}

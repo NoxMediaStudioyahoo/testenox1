@@ -1,0 +1,15 @@
+﻿services:
+  - type: web
+    name: noxmedia-frontend
+    env: static
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: VITE_HMR_HOST
+        value: noxmedia.studio
+      - key: VITE_API_URL
+        sync: false # This will be configured in the Render.com dashboard

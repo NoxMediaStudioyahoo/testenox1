@@ -1,35 +1,27 @@
+﻿# Node modules
+node_modules/
+
+# Build output
+dist/
+
 # Logs
-logs
-*.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
 
-# Dependency directories
-node_modules
-
-# Build output
-dist
-dist-ssr
-*.local
-
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-.idea
-.DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
-
-# Visual Studio folder
+# IDE files
+.vscode/
 .vs/
-*.vsidx
+.idea/
 
-# Python virtual environment
-backend/venv/
-venv/
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Misc
+.DS_Store
+*.log
+
+# TypeScript
+*.tsbuildinfo

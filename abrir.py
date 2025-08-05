@@ -15,6 +15,7 @@ def is_port_in_use(port):
 WORKSPACE_DIR = Path(os.getcwd())
 BACKEND_DIR = WORKSPACE_DIR / 'backend'
 FRONTEND_DIR = WORKSPACE_DIR
+SUPPORTERS_SERVER = WORKSPACE_DIR / 'supporters-server.cjs'
 
 # Verificar se os diretórios existem
 if not BACKEND_DIR.exists():
@@ -31,8 +32,9 @@ if is_port_in_use(5173):
     sys.exit(1)
 
 # Comandos
-BACKEND_CMD = [sys.executable, '-m', 'uvicorn', 'app:app', '--reload']
+BACKEND_CMD = [sys.executable, '-m', 'uvicorn', 'app:app', '--host', '0.0.0.0', '--port', '8000', '--reload']
 FRONTEND_CMD = ['npm', 'run', 'dev'] if os.name != 'nt' else ['cmd', '/c', 'npm', 'run', 'dev']
+SUPPORTERS_CMD = ['node', str(SUPPORTERS_SERVER)]
 
 processes = []
 
@@ -67,6 +69,12 @@ try:
 
     time.sleep(2)
 
+    print('🚀 Iniciando o servidor de apoiadores...')
+    supporters_proc = subprocess.Popen(SUPPORTERS_CMD, cwd=WORKSPACE_DIR)
+    processes.append(supporters_proc)
+
+    time.sleep(2)
+
     print('🚀 Iniciando o frontend...')
     frontend_proc = subprocess.Popen(FRONTEND_CMD, cwd=FRONTEND_DIR)
     processes.append(frontend_proc)
@@ -74,6 +82,7 @@ try:
     print('\n✅ Tudo pronto! Seus serviços estão rodando:')
     print('   - Backend:  http://localhost:8000')
     print('   - Frontend: http://localhost:5173')
+    print('   - Supporters: http://localhost:8000/api/supporters')
     print('\n🌐 O navegador será aberto automaticamente. Aproveite!')
     print('\nPara encerrar, pressione Ctrl+C a qualquer momento.')
 
@@ -86,6 +95,9 @@ try:
             break
         if frontend_proc.poll() is not None:
             print('❗ O frontend foi finalizado inesperadamente. Verifique os logs para mais detalhes.')
+            break
+        if supporters_proc.poll() is not None:
+            print('❗ O servidor de apoiadores foi finalizado inesperadamente. Verifique os logs para mais detalhes.')
             break
         time.sleep(1)
 

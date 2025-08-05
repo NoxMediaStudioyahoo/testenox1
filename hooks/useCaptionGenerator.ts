@@ -1,7 +1,8 @@
 ﻿import { useState, useEffect, useRef } from 'react';
 import { Caption, VideoSource } from '../types';
+import { useProtection } from './useProtection';
 
-const BACKEND_URL = 'https://backendnoxsub.vercel.app/api';
+const BACKEND_URL = 'http://localhost:8000/api';
 
 // Função para testar se o backend está disponível
 async function testBackendConnection(): Promise<boolean> {
@@ -14,8 +15,7 @@ async function testBackendConnection(): Promise<boolean> {
             mode: 'cors',
             credentials: 'omit',
             headers: {
-                'Accept': 'application/json',
-                'Content-Type': 'application/json',
+                'Accept': 'application/json'
             },
             signal: controller.signal
         });
@@ -37,8 +37,10 @@ export const useCaptionGenerator = (
     videoDuration: number,
     language: string,
     model: string = 'small',
-    shouldGenerate: boolean = false
+    shouldGenerate: boolean = false,
+    captionStyle?: any
 ) => {
+    const { protectedFetch, isThrottled } = useProtection();
     const [captions, setCaptions] = useState<Caption[]>([]);
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -55,12 +57,10 @@ export const useCaptionGenerator = (
             clearInterval(timerRef.current);
             timerRef.current = null;
         }
-
         if (eventSourceRef.current) {
             eventSourceRef.current.close();
             eventSourceRef.current = null;
         }
-
         if (abortControllerRef.current) {
             abortControllerRef.current.abort();
             abortControllerRef.current = null;
@@ -89,7 +89,6 @@ export const useCaptionGenerator = (
             abortControllerRef.current = new AbortController();
 
             try {
-                // Testar conexão com o backend antes de prosseguir
                 setLoadingText('Verificando servidor backend...');
                 const isBackendAvailable = await testBackendConnection();
                 if (!isBackendAvailable) {
@@ -97,36 +96,50 @@ export const useCaptionGenerator = (
                 }
 
                 setLoadingText('Baixando vídeo...');
-
-                // Download do vídeo com timeout
                 const videoResponse = await fetch(videoSource.url, {
                     signal: abortControllerRef.current.signal
                 });
-
                 if (!videoResponse.ok) {
                     throw new Error(`Não foi possível baixar o vídeo. Status: ${videoResponse.status}`);
                 }
-
                 const blob = await videoResponse.blob();
                 const file = new File([blob], videoSource.filename || 'video.mp4', { type: blob.type });
                 const sessionId = `session_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 
                 setLoadingText('Preparando transcrição...');
-
                 const formData = new FormData();
                 formData.append('file', file);
                 formData.append('model', model);
                 formData.append('language', language);
                 formData.append('session_id', sessionId);
 
-                // Iniciar timer
+                // --- reCAPTCHA: estrutura para integração futura ---
+                // Antes de enviar para o backend, obtenha o token do reCAPTCHA e envie junto
+                // Exemplo:
+                // const recaptchaToken = await getRecaptchaToken();
+                // formData.append('recaptchaToken', recaptchaToken);
+
                 timerRef.current = setInterval(() => setElapsed(e => e + 1), 1000);
 
-                // Não há suporte a EventSource no Vercel Python, então pula status SSE
+                // --- SSE para progresso ---
+                if (eventSourceRef.current) eventSourceRef.current.close();
+                const sseUrl = `${BACKEND_URL}/transcribe-status?session_id=${encodeURIComponent(sessionId)}`;
+                const es = new window.EventSource(sseUrl);
+                eventSourceRef.current = es;
+                es.onmessage = (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        if (data.status) setLoadingText(data.status);
+                        if (typeof data.stepId !== 'undefined') setStepId(data.stepId);
+                    } catch {}
+                };
+                es.onerror = () => {
+                    es.close();
+                };
 
-                // Fazer a requisição de transcrição
                 setLoadingText('Enviando vídeo para transcrição...');
-                const backendResponse = await fetch(`${BACKEND_URL}/transcribe`, {
+                // Usa protectedFetch em vez de fetch normal
+                const backendResponse = await protectedFetch(`${BACKEND_URL}/transcribe`, {
                     method: 'POST',
                     body: formData,
                     mode: 'cors',
@@ -146,7 +159,6 @@ export const useCaptionGenerator = (
                     setCaptions(parsedCaptions);
                     setLoadingText('Transcrição concluída!');
                 } else {
-                    console.warn('Nenhuma legenda foi gerada, criando legenda padrão');
                     setCaptions([{
                         id: 1,
                         start: 0,
@@ -155,7 +167,6 @@ export const useCaptionGenerator = (
                     }]);
                     setLoadingText('Transcrição não gerou resultados');
                 }
-
             } catch (e: any) {
                 console.error("Erro ao gerar legendas:", e);
 
@@ -169,6 +180,8 @@ export const useCaptionGenerator = (
                         '2. O servidor backend permite requisições CORS';
                 } else if (e.message.includes('não está rodando') || e.message.includes('não foi possível conectar')) {
                     errorMsg = e.message;
+                } else if (e.message.includes('não contém uma trilha de áudio válida') || e.message.includes('audio track')) {
+                    errorMsg = 'O vídeo enviado não possui áudio. Por favor, envie um vídeo com áudio.';
                 } else {
                     errorMsg = e.message || String(e);
                 }
@@ -200,7 +213,13 @@ export const useCaptionGenerator = (
         return cleanup;
     }, [videoSource, videoDuration, language, model, shouldGenerate]);
 
-    const downloadRenderedVideo = async (quality: 'low' | 'medium' | 'high' = 'medium') => {
+    // Adiciona suporte a salvar em pasta customizada usando File System Access API
+    const downloadRenderedVideo = async (
+        quality: 'low' | 'medium' | 'high' = 'medium',
+        filenameOverride?: string,
+        dirHandle?: FileSystemDirectoryHandle | null,
+        onSuccess?: () => void
+    ) => {
         try {
             if (!videoSource || captions.length === 0) {
                 throw new Error('Vídeo ou legendas não disponíveis.');
@@ -227,7 +246,15 @@ export const useCaptionGenerator = (
             formData.append('file', file);
             formData.append('captions', captionsFile);
             formData.append('quality', quality);
+            if (captionStyle) {
+                formData.append('style', JSON.stringify(captionStyle));
+            }
 
+            // --- reCAPTCHA: estrutura para integração futura ---
+            // const recaptchaToken = await getRecaptchaToken();
+            // formData.append('recaptchaToken', recaptchaToken);
+
+            // Usa fetch normal, sem autenticação
             const backendResponse = await fetch(`${BACKEND_URL}/render`, {
                 method: 'POST',
                 body: formData,
@@ -240,25 +267,35 @@ export const useCaptionGenerator = (
                 throw new Error(`Erro do servidor (${backendResponse.status}): ${errorText}`);
             }
 
-            // Recebe o nome do arquivo gerado
-            const json = await backendResponse.json();
-            const filename = json.filename;
-            if (!filename) throw new Error('Arquivo legendado não gerado.');
-            const fileUrl = `${BACKEND_URL}/files/${filename}`;
+            // Baixa o arquivo de vídeo legendado diretamente da resposta
+            const videoBlob = await backendResponse.blob();
+            let filename = filenameOverride || 'video_legendado.mp4';
+            const disposition = backendResponse.headers.get('content-disposition');
+            if (disposition) {
+                const match = disposition.match(/filename="?([^";]+)"?/);
+                if (match && match[1]) filename = match[1];
+            }
 
-            // Faz o download via GET
-            const fileResponse = await fetch(fileUrl);
-            if (!fileResponse.ok) throw new Error('Falha ao baixar o arquivo legendado.');
-            const videoBlob = await fileResponse.blob();
-            const url = URL.createObjectURL(videoBlob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            URL.revokeObjectURL(url);
-
+            // File System Access API: salvar na pasta escolhida
+            if (dirHandle && 'createWritable' in dirHandle) {
+                // @ts-ignore
+                const fileHandle = await dirHandle.getFileHandle(filename, { create: true });
+                // @ts-ignore
+                const writable = await fileHandle.createWritable();
+                await writable.write(videoBlob);
+                await writable.close();
+            } else {
+                // Fallback: download normal
+                const url = URL.createObjectURL(videoBlob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+            }
+            if (onSuccess) onSuccess();
         } catch (e: any) {
             const errorMsg = e.message || String(e);
             console.error('Erro ao baixar vídeo legendado:', e);
