@@ -1,12 +1,43 @@
-﻿import { defineConfig } from 'vite';
+﻿import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 
-export default defineConfig({
-  plugins: [react()],
-  server: {
-    host: '0.0.0.0'
-  },
-  preview: {
-    allowedHosts: ['noxv1.onrender.com', 'noxmedia.onrender.com']
-  }
+export default defineConfig(({ command, mode }) => {
+    // Load env file based on mode
+    const env = loadEnv(mode, process.cwd(), '');
+
+    return {
+        plugins: [react()],
+        server: {
+            port: parseInt(process.env.PORT || '5173'),
+            strictPort: true,
+            host: true, // Needed for docker/render.com
+            // Allow all origins in development
+            cors: true,
+            headers: {
+                'Access-Control-Allow-Origin': '*'
+            },
+            hmr: {
+                // Fall back to ws:// when in production
+                protocol: 'ws',
+                // Support render.com and localhost
+                host: process.env.VITE_HMR_HOST || 'localhost',
+                port: parseInt(process.env.PORT || '5173'),
+            }
+        },
+        preview: {
+            port: parseInt(process.env.PORT || '5173'),
+            strictPort: true,
+            host: true,
+            cors: true,
+            headers: {
+                'Access-Control-Allow-Origin': '*'
+            },
+            // Adicione esta linha para permitir o host do Render.com
+            allowedHosts: [
+                'testenox1-7bya.onrender.com',
+                'localhost',
+                '.onrender.com' // Permite qualquer subdomínio do onrender.com
+            ]
+        }
+    }
 });
