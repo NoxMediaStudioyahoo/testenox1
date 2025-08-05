@@ -1,16 +1,10 @@
 ﻿import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 
-const allowedHostsList = [
-    'localhost',
-    '127.0.0.1',
-    'testenox1-7bya.onrender.com'
-];
-
 export default defineConfig(({ command, mode }) => {
     // Load env file based on mode
     const env = loadEnv(mode, process.cwd(), '');
-    
+
     return {
         plugins: [react()],
         server: {
@@ -19,7 +13,6 @@ export default defineConfig(({ command, mode }) => {
             host: true, // Needed for docker/render.com
             // Allow all origins in development
             cors: true,
-            allowedHosts: allowedHostsList,
             headers: {
                 'Access-Control-Allow-Origin': '*'
             },
@@ -36,10 +29,15 @@ export default defineConfig(({ command, mode }) => {
             strictPort: true,
             host: true,
             cors: true,
-            allowedHosts: allowedHostsList,
             headers: {
                 'Access-Control-Allow-Origin': '*'
-            }
+            },
+            // Adicione esta linha para permitir o host do Render.com
+            allowedHosts: [
+                'testenox1-7bya.onrender.com',
+                'localhost',
+                '.onrender.com' // Permite qualquer subdomínio do onrender.com
+            ]
         }
     }
 });
